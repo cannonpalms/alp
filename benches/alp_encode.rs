@@ -3,7 +3,8 @@
 //! The `alp_exponent_search_*` cases other than `rotating_*` search one input over and over. The
 //! branch predictor learns that input's data-dependent branches, so those cases under-report the
 //! cost for a caller that searches a new block each time. The `rotating_*` cases give every call a
-//! different input from a pool of 128, so the predictor cannot memorize one input.
+//! different input from a pool of 128, so the predictor cannot memorize one input. The
+//! `rotating_*_hinted` cases pass the exponents the search finds for that input as the hint.
 
 #![allow(missing_docs)]
 
@@ -207,6 +208,23 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
                     pool[next].as_slice()
                 },
                 |input| alp::find_best_exponents(input),
+                BatchSize::SmallInput,
+            );
+        });
+        // The hint is what `find_best_exponents` returns for the same input, found outside the
+        // measured region, as when a column's consecutive blocks share their exponents.
+        let hints: Vec<Exponents> = pool
+            .iter()
+            .map(|input| alp::find_best_exponents(input))
+            .collect();
+        group.bench_function(format!("{case}_hinted"), |b| {
+            let mut next = 0;
+            b.iter_batched_ref(
+                || {
+                    next = (next + 1) % POOL;
+                    (pool[next].as_slice(), hints[next])
+                },
+                |(input, hint)| alp::find_best_exponents_with_hint(input, *hint),
                 BatchSize::SmallInput,
             );
         });
