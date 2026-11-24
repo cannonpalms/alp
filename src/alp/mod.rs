@@ -199,19 +199,18 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
                 }
                 scaled_e = exp.e;
             }
-            let Some(size) = estimate_scaled(sample, scaled.iter().copied(), exp, best_nbytes)
-            else {
-                return;
-            };
             let digits = exp.e - exp.f;
             let best_digits = best_exp.e - best_exp.f;
             // Break size ties by fewer retained decimal digits, then the identity
             // candidate (e=f=0), otherwise the largest exponent.
-            if size < best_nbytes
-                || (size == best_nbytes
-                    && (digits < best_digits
-                        || (digits == best_digits && best_exp.e != 0 && exp.e > best_exp.e)))
-            {
+            let wins_tie = digits < best_digits
+                || (digits == best_digits && best_exp.e != 0 && exp.e > best_exp.e);
+            let Some(size) =
+                estimate_scaled(sample, scaled.iter().copied(), exp, best_nbytes, !wins_tie)
+            else {
+                return;
+            };
+            if size < best_nbytes || (size == best_nbytes && wins_tie) {
                 best_nbytes = size;
                 best_exp = exp;
             }
@@ -501,6 +500,7 @@ fn estimate_encoded_size_within<T: ALPFloat>(
         values.iter().map(|&value| value * power),
         exponents,
         limit,
+        false,
     )
 }
 
@@ -538,15 +538,16 @@ impl<T: ALPFloat> Tally<T> {
         Some(())
     }
 
-    /// Whether the final size must exceed `limit`. Once any value round-trips, the final range
-    /// includes all kept values seen so far. Its bit width and the patch count can only grow.
-    /// Never rejects a possible tie.
+    /// Whether the final size must exceed `limit`, or reach it when `tie_loses`. Once any value
+    /// round-trips, the final range includes all kept values seen so far. Its bit width and the
+    /// patch count can only grow.
     #[inline(always)]
-    fn exceeds(&self, len: usize, limit: usize) -> bool {
-        limit != usize::MAX
-            && self.kept.is_some()
-            && encoded_bytes_for_range(len, self.kept) + self.patch_count * patch_bytes::<T>()
-                > limit
+    fn exceeds(&self, len: usize, limit: usize, tie_loses: bool) -> bool {
+        if limit == usize::MAX || self.kept.is_none() {
+            return false;
+        }
+        let bound = encoded_bytes_for_range(len, self.kept) + self.patch_count * patch_bytes::<T>();
+        bound > limit || (tie_loses && bound == limit)
     }
 }
 
@@ -555,12 +556,16 @@ impl<T: ALPFloat> Tally<T> {
 ///
 /// Multiplying by `10^-f` afterwards rounds exactly as [`ALPFloat::encode_single_unchecked`]
 /// does, which multiplies by `10^e` first and `10^-f` second.
+///
+/// With `tie_loses` set the pair would lose a tie at `limit`, so it also returns `None` as soon as
+/// its size is known to reach `limit`, not only once it exceeds it.
 #[inline]
 fn estimate_scaled<T: ALPFloat>(
     values: &[T],
     mut scaled: impl Iterator<Item = T>,
     exponents: Exponents,
     limit: usize,
+    tie_loses: bool,
 ) -> Option<usize> {
     // `encode` fills patched slots within the kept range, unless every value is patched.
     let mut tally = Tally::<T> {
@@ -576,7 +581,7 @@ fn estimate_scaled<T: ALPFloat>(
             // rest of the first chunk.
             let (head, tail) = chunk.split_at(EARLY_CHECK);
             tally.score(head, &mut scaled, exponents, limit)?;
-            if tally.exceeds(values.len(), limit) {
+            if tally.exceeds(values.len(), limit, tie_loses) {
                 return None;
             }
             tally.score(tail, &mut scaled, exponents, limit)?;
@@ -584,7 +589,7 @@ fn estimate_scaled<T: ALPFloat>(
             tally.score(chunk, &mut scaled, exponents, limit)?;
         }
         // Check after each full chunk to avoid paying for range scoring at every sample.
-        if tally.exceeds(values.len(), limit) {
+        if tally.exceeds(values.len(), limit, tie_loses) {
             return None;
         }
     }
