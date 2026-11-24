@@ -1,3 +1,8 @@
+#[cfg(target_arch = "x86_64")]
+mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod vector;
+
 use crate::sample::SamplePlan;
 use itertools::Itertools;
 use num_traits::{CheckedSub, Float, PrimInt, ToPrimitive};
@@ -37,11 +42,47 @@ impl Display for Exponents {
     }
 }
 
+/// Scores one exponent pair of a sample: the values, the same values multiplied by `10^e`, the
+/// pair, the limit and whether a tie with the limit loses. See [`estimate_scaled`].
+type PairScorer<T> = fn(&[T], &[T], Exponents, usize, bool) -> Option<usize>;
+
+/// The fewest values for which the search uses a vectorized pair scorer.
+///
+/// On a short input the scalar path stops a pair after fewer values than a kernel that checks its
+/// bound once per chunk of eight, and the kernel's setup per pair is not paid back. At 24 values
+/// and above the kernel was not slower than the scalar path on x86-64 with AVX2, with or without
+/// a hint, for decimal and integer inputs.
+const PAIR_SCORER_MIN_LEN: usize = 24;
+
 mod private {
-    pub trait Sealed {}
+    use super::PairScorer;
+
+    pub trait Sealed: Sized {
+        /// A vectorized replacement for the scalar scoring of a pair that returns the same
+        /// results, if this type has one and the CPU supports it.
+        ///
+        /// This is a hook on the sealed trait, not a cast of the slice, so that only the type a
+        /// kernel is written for ever reaches it. The search asks once and keeps the answer, so
+        /// that CPU detection is not repeated for every pair.
+        fn pair_scorer() -> Option<PairScorer<Self>> {
+            None
+        }
+    }
 
     impl Sealed for f32 {}
-    impl Sealed for f64 {}
+
+    impl Sealed for f64 {
+        fn pair_scorer() -> Option<PairScorer<Self>> {
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return Some(|values, scaled, exponents, limit, tie_loses| {
+                    // SAFETY: the CPU supports AVX2.
+                    unsafe { super::avx2::score_pair(values, scaled, exponents, limit, tie_loses) }
+                });
+            }
+            None
+        }
+    }
 }
 
 /// Encodes an array of floating-point values, finding the best exponents if they are not provided.
@@ -463,6 +504,40 @@ fn gather_interleaved<T: ALPFloat>(values: &[T], plan: &SamplePlan) -> ([T; SAMP
 /// scored first, and any other pair outside the candidate set, `e` below [`ALPFloat::MAX_EXPONENT`]
 /// and `f` at most `e`, could win although the search never returns it.
 fn search_exponents<T: ALPFloat>(values: &[T], hint: Option<Exponents>) -> Exponents {
+    let scorer = T::pair_scorer().filter(|_| values.len() >= PAIR_SCORER_MIN_LEN);
+    search_exponents_with(values, hint, scorer)
+}
+
+/// [`search_exponents`] with the pair scorer given, `None` for the scalar path.
+///
+/// Each path gets its own copy of the search, so that the scalar path pays nothing for the choice.
+fn search_exponents_with<T: ALPFloat>(
+    values: &[T],
+    hint: Option<Exponents>,
+    scorer: Option<PairScorer<T>>,
+) -> Exponents {
+    match scorer {
+        Some(score) => search_exponents_scoring(values, hint, score),
+        None => search_exponents_scoring(values, hint, score_pair_scalar::<T>),
+    }
+}
+
+/// The scalar pair scorer, with the signature of a [`PairScorer`]. See [`estimate_scaled`].
+fn score_pair_scalar<T: ALPFloat>(
+    values: &[T],
+    scaled: &[T],
+    exponents: Exponents,
+    limit: usize,
+    tie_loses: bool,
+) -> Option<usize> {
+    estimate_scaled(values, scaled.iter().copied(), exponents, limit, tie_loses)
+}
+
+fn search_exponents_scoring<T: ALPFloat>(
+    values: &[T],
+    hint: Option<Exponents>,
+    score: impl Fn(&[T], &[T], Exponents, usize, bool) -> Option<usize>,
+) -> Exponents {
     let hint = hint.filter(|h| h.e < T::MAX_EXPONENT && h.f <= h.e && h.e != 0);
     let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
     let (sample, len) = gather_interleaved(values, &plan);
@@ -474,7 +549,9 @@ fn search_exponents<T: ALPFloat>(values: &[T], hint: Option<Exponents>) -> Expon
     let mut scaled_e = 0;
 
     let mut best_exp = Exponents { e: 0, f: 0 };
-    let mut best_nbytes = T::estimate_encoded_size_for_exponents(sample, best_exp);
+    // Scaling by 10^0 is exact, so the sample stands in for its own scaled copy.
+    let mut best_nbytes = score(sample, sample, best_exp, usize::MAX, false)
+        .expect("an unbounded estimate always completes");
 
     let mut consider = |exp: Exponents| {
         if scaled_e != exp.e {
@@ -490,9 +567,7 @@ fn search_exponents<T: ALPFloat>(values: &[T], hint: Option<Exponents>) -> Expon
         // candidate (e=f=0), otherwise the largest exponent.
         let wins_tie = digits < best_digits
             || (digits == best_digits && best_exp.e != 0 && exp.e > best_exp.e);
-        let Some(size) =
-            estimate_scaled(sample, scaled.iter().copied(), exp, best_nbytes, !wins_tie)
-        else {
+        let Some(size) = score(sample, scaled, exp, best_nbytes, !wins_tie) else {
             return;
         };
         if size < best_nbytes || (size == best_nbytes && wins_tie) {
@@ -900,6 +975,7 @@ impl ALPFloat for f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::private::Sealed;
     use super::*;
 
     // Each candidate's allocation-free size estimate must match a full encode plus estimate.
@@ -1142,6 +1218,11 @@ mod tests {
     fn check_search_matches_frozen<T: ALPFloat>(values: &[T], context: &str) {
         let frozen = frozen_search(values);
         assert_eq!(T::find_best_exponents(values), frozen, "{context}");
+        assert_eq!(
+            search_exponents_with(values, None, None),
+            frozen,
+            "scalar path, {context}"
+        );
     }
 
     const SEARCH_LENGTHS: [usize; 18] = [
@@ -1160,6 +1241,193 @@ mod tests {
                     check_search_matches_frozen(&values, &format!("f64, {context}"));
                     let f32s: Vec<f32> = values.iter().map(|&v| v as f32).collect();
                     check_search_matches_frozen(&f32s, &format!("f32, {context}"));
+                }
+            }
+        }
+    }
+
+    /// Whether a pair's result keeps it in the running against `limit`.
+    fn survives(size: Option<usize>, limit: usize, tie_loses: bool) -> bool {
+        size.is_some_and(|size| size < limit || (size == limit && !tie_loses))
+    }
+
+    /// The vector kernel of this CPU, if it has one. A CPU that supports AVX2 must have one, so
+    /// that the tests below do not quietly compare the scalar path with itself.
+    fn kernel() -> Option<PairScorer<f64>> {
+        let scorer = f64::pair_scorer();
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            assert!(scorer.is_some(), "AVX2 is available but there is no kernel");
+        }
+        scorer
+    }
+
+    /// Holds the vector kernel to the scalar scoring of every pair, for the size and for what
+    /// each limit prunes. Does nothing when there is no kernel on this CPU.
+    fn check_kernel_matches_scalar(values: &[f64], context: &str) {
+        let Some(score) = kernel() else {
+            return;
+        };
+        for e in 0..f64::MAX_EXPONENT {
+            let scaled: Vec<f64> = values.iter().map(|&v| v * f64::F10[e as usize]).collect();
+            for f in 0..=e {
+                let exp = Exponents { e, f };
+                let context = format!("{context}, {exp}");
+                let exact = estimate_scaled(values, scaled.iter().copied(), exp, usize::MAX, false)
+                    .expect("an unbounded estimate always completes");
+                assert_eq!(
+                    score(values, &scaled, exp, usize::MAX, false),
+                    Some(exact),
+                    "{context}"
+                );
+                let limits = [
+                    0,
+                    exact / 2,
+                    exact.saturating_sub(1),
+                    exact,
+                    exact + 1,
+                    exact + 9,
+                ];
+                for limit in limits {
+                    for tie_loses in [false, true] {
+                        let scalar =
+                            estimate_scaled(values, scaled.iter().copied(), exp, limit, tie_loses);
+                        let kernel = score(values, &scaled, exp, limit, tie_loses);
+                        let ctx = format!("{context}, limit {limit}, tie_loses {tie_loses}");
+                        assert!(kernel.is_none() || kernel == Some(exact), "{ctx}");
+                        assert_eq!(
+                            survives(kernel, limit, tie_loses),
+                            survives(scalar, limit, tie_loses),
+                            "{ctx}"
+                        );
+                        if kernel.is_none() {
+                            assert!(!survives(Some(exact), limit, tie_loses), "{ctx}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_scores_every_pair_like_the_scalar_path() {
+        for kind in 0..KINDS {
+            for len in [0, 1, 7, 8, 9, 16, 23, 33, 64, 65] {
+                for seed in 0..3u64 {
+                    let mut rng =
+                        Lcg::from_seed(((kind as u64) << 40) | ((len as u64) << 8) | seed);
+                    let values = gen_values(&mut rng, kind, len);
+                    check_kernel_matches_scalar(
+                        &values,
+                        &format!("kind {kind}, len {len}, seed {seed}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Values that sit on the edges of the conversion the kernel reproduces.
+    fn edge_values() -> Vec<f64> {
+        let two_pow_63 = 9_223_372_036_854_775_808.0f64;
+        let mut pool = vec![
+            0.0,
+            -0.0,
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            4.9e-324,
+            -4.9e-324,
+            2.2e-310,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            0.3,
+            -0.3,
+            1.0 / 3.0,
+        ];
+        for e in 0..f64::MAX_EXPONENT as usize {
+            // Scaled by 10^e these land at, just inside and just beyond +-2^63.
+            let at = two_pow_63 / f64::F10[e];
+            for v in [
+                at,
+                at * 0.999,
+                at * 1.001,
+                at * 2.0,
+                f64::from_bits(at.to_bits() + 1),
+            ] {
+                pool.push(v);
+                pool.push(-v);
+            }
+        }
+        // Negative values between -2^52 and -2^51 are spaced by 0.5, so the sweet-number
+        // rounding leaves a fraction that the conversion truncates.
+        for step in [0u32, 1, 2, 3, 7, 1000] {
+            let v = -(2_251_799_813_685_248.0 + f64::from(step) * 0.5);
+            pool.push(v);
+            pool.push(v - 0.5);
+            pool.push(-v);
+            pool.push(v / 10.0);
+            pool.push(v / 1000.0);
+        }
+        pool
+    }
+
+    #[test]
+    fn kernel_scores_edge_values_like_the_scalar_path() {
+        let pool = edge_values();
+        for len in [1, 7, 8, 9, 15, 16, 17, 24, 64] {
+            for seed in 0..40u64 {
+                let mut rng = Lcg::from_seed(((len as u64) << 8) | seed);
+                // Half the seeds draw from the whole pool, the rest mix it into decimal data.
+                let values: Vec<f64> = (0..len)
+                    .map(|_| {
+                        if seed % 2 == 0 || rng.next_below(3) == 0 {
+                            pool[rng.next_below(pool.len())]
+                        } else {
+                            rng.next_decimal(100.0, 2)
+                        }
+                    })
+                    .collect();
+                check_kernel_matches_scalar(&values, &format!("len {len}, seed {seed}"));
+            }
+        }
+        for v in &pool {
+            check_kernel_matches_scalar(&[*v; 9], &format!("{v:e} x 9"));
+        }
+        check_kernel_matches_scalar(&[0.0, -0.0, 0.0, -0.0, -0.0, 0.0, -0.0, 0.0, -0.0], "zeros");
+        let mut nans_then_one = [f64::NAN; 9];
+        nans_then_one[8] = 1.0;
+        check_kernel_matches_scalar(&nans_then_one, "eight NaNs then one");
+    }
+
+    #[test]
+    fn search_returns_the_same_pair_with_and_without_the_kernel() {
+        let pool = edge_values();
+        for kind in 0..KINDS {
+            for len in SEARCH_LENGTHS {
+                for seed in 0..10u64 {
+                    let mut rng =
+                        Lcg::from_seed(((kind as u64) << 40) | ((len as u64) << 8) | seed);
+                    let mut values = gen_values(&mut rng, kind, len);
+                    if seed % 3 == 0 && !values.is_empty() {
+                        for _ in 0..4 {
+                            let at = rng.next_below(values.len());
+                            values[at] = pool[rng.next_below(pool.len())];
+                        }
+                    }
+                    for hint in [None, Some(Exponents { e: 2, f: 0 })] {
+                        assert_eq!(
+                            search_exponents_with(&values, hint, kernel()),
+                            search_exponents_with(&values, hint, None),
+                            "kind {kind}, len {len}, seed {seed}, hint {hint:?}"
+                        );
+                    }
                 }
             }
         }

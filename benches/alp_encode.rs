@@ -14,6 +14,7 @@ use std::mem::MaybeUninit;
 
 const LEN: usize = 1024;
 const POOL: usize = 128;
+const SHORT_LEN: usize = 16;
 
 /// A small linear congruential generator, to keep the benchmarks dependency-free and repeatable.
 struct Lcg(u64);
@@ -37,8 +38,9 @@ fn round_to(value: f64, decimals: i32) -> f64 {
     (value * scale).round() / scale
 }
 
-/// Pools of `POOL` inputs of `LEN` values, each pool of one kind. Within a pool the inputs differ
-/// in magnitude or in the number of decimals, so the best exponents move from input to input.
+/// Pools of `POOL` inputs of `LEN` values, each pool of one kind, and one of `SHORT_LEN` values.
+/// Within a pool the inputs differ in magnitude or in the number of decimals, so the best
+/// exponents move from input to input.
 fn pools<F: ALPFloat>() -> Vec<(&'static str, Vec<Vec<F>>)> {
     let convert = |values: Vec<f64>| -> Vec<F> {
         values
@@ -88,8 +90,14 @@ fn pools<F: ALPFloat>() -> Vec<(&'static str, Vec<Vec<F>>)> {
             })
             .collect()
     });
+    // Short blocks are where a vectorized scorer has the least to gain.
+    let short_decimal = decimal
+        .iter()
+        .map(|input| input[..SHORT_LEN].to_vec())
+        .collect();
     vec![
         ("rotating_decimal", decimal),
+        ("rotating_decimal_16", short_decimal),
         ("rotating_integer", integer),
         ("rotating_full_precision", full_precision),
         ("rotating_two_decimals", two_decimals),
@@ -200,6 +208,7 @@ fn bench_float<F: ALPFloat>(c: &mut Criterion, name: &str) {
     }
     // The setup closure picks the next input, so the choice is not measured.
     for (case, pool) in pools::<F>() {
+        group.throughput(Throughput::Elements(pool[0].len() as u64));
         group.bench_function(case, |b| {
             let mut next = 0;
             b.iter_batched_ref(
