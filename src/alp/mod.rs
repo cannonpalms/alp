@@ -178,13 +178,17 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     #[inline]
     fn find_best_exponents(values: &[Self]) -> Exponents {
         let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
-        let sample: Vec<Self> = plan.iter(values).copied().collect();
+        let mut sample = [Self::zero(); SAMPLE_SIZE];
+        for (slot, &value) in sample.iter_mut().zip(plan.iter(values)) {
+            *slot = value;
+        }
+        let sample = &sample[..plan.count()];
 
         let mut best_exp = Exponents { e: 0, f: 0 };
-        let mut best_nbytes = Self::estimate_encoded_size_for_exponents(&sample, best_exp);
+        let mut best_nbytes = Self::estimate_encoded_size_for_exponents(sample, best_exp);
 
         let mut consider = |exp: Exponents| {
-            let Some(size) = estimate_encoded_size_within(&sample, exp, best_nbytes) else {
+            let Some(size) = estimate_encoded_size_within(sample, exp, best_nbytes) else {
                 return;
             };
             let digits = exp.e - exp.f;
