@@ -7,6 +7,8 @@ use std::mem::{MaybeUninit, size_of, transmute, transmute_copy};
 /// Maximum number of values examined per candidate exponent pair.
 const SAMPLE_SIZE: usize = 64;
 const SAMPLE_BLOCK: usize = 8;
+/// Values scored before the first range check of a pair.
+const EARLY_CHECK: usize = 4;
 
 /// The number of values encoded per chunk.
 ///
@@ -568,8 +570,19 @@ fn estimate_scaled<T: ALPFloat>(
     };
 
     let (chunks, remainder) = values.as_chunks::<8>();
-    for chunk in chunks {
-        tally.score(chunk, &mut scaled, exponents, limit)?;
+    for (n, chunk) in chunks.iter().enumerate() {
+        if n == 0 {
+            // A pair that cannot win is usually clear after a few values, and this saves the
+            // rest of the first chunk.
+            let (head, tail) = chunk.split_at(EARLY_CHECK);
+            tally.score(head, &mut scaled, exponents, limit)?;
+            if tally.exceeds(values.len(), limit) {
+                return None;
+            }
+            tally.score(tail, &mut scaled, exponents, limit)?;
+        } else {
+            tally.score(chunk, &mut scaled, exponents, limit)?;
+        }
         // Check after each full chunk to avoid paying for range scoring at every sample.
         if tally.exceeds(values.len(), limit) {
             return None;
