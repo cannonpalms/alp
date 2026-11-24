@@ -183,12 +183,25 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
             *slot = value;
         }
         let sample = &sample[..plan.count()];
+        // `sample[i] * 10^e`, which every pair with the same `e` shares. `consider` is never
+        // called with `e == 0`, so its first call fills this.
+        let mut scaled = [Self::zero(); SAMPLE_SIZE];
+        let scaled = &mut scaled[..sample.len()];
+        let mut scaled_e = 0;
 
         let mut best_exp = Exponents { e: 0, f: 0 };
         let mut best_nbytes = Self::estimate_encoded_size_for_exponents(sample, best_exp);
 
         let mut consider = |exp: Exponents| {
-            let Some(size) = estimate_encoded_size_within(sample, exp, best_nbytes) else {
+            if scaled_e != exp.e {
+                let power = Self::F10[exp.e as usize];
+                for (scaled, &value) in scaled.iter_mut().zip(sample) {
+                    *scaled = value * power;
+                }
+                scaled_e = exp.e;
+            }
+            let Some(size) = estimate_scaled(sample, scaled.iter().copied(), exp, best_nbytes)
+            else {
                 return;
             };
             let digits = exp.e - exp.f;
@@ -458,6 +471,28 @@ fn estimate_encoded_size_within<T: ALPFloat>(
     exponents: Exponents,
     limit: usize,
 ) -> Option<usize> {
+    let power = T::F10[exponents.e as usize];
+    estimate_scaled(
+        values,
+        values.iter().map(|&value| value * power),
+        exponents,
+        limit,
+    )
+}
+
+/// [`estimate_encoded_size_within`] with the values already multiplied by `10^e`, yielded by
+/// `scaled` in the order of `values`, so that the pairs sharing an `e` can reuse one scaling.
+///
+/// Multiplying by `10^-f` afterwards rounds exactly as [`ALPFloat::encode_single_unchecked`]
+/// does, which multiplies by `10^e` first and `10^-f` second.
+#[inline]
+fn estimate_scaled<T: ALPFloat>(
+    values: &[T],
+    mut scaled: impl Iterator<Item = T>,
+    exponents: Exponents,
+    limit: usize,
+) -> Option<usize> {
+    let inverse = T::IF10[exponents.f as usize];
     // `encode` fills patched slots within the kept range, unless every value is patched.
     let mut kept: Option<(T::ALPInt, T::ALPInt)> = None;
     let mut all: Option<(T::ALPInt, T::ALPInt)> = None;
@@ -465,8 +500,8 @@ fn estimate_encoded_size_within<T: ALPFloat>(
 
     let (chunks, remainder) = values.as_chunks::<8>();
     for chunk in chunks {
-        for &value in chunk {
-            let encoded = T::encode_single_unchecked(value, exponents);
+        for (&value, scaled) in chunk.iter().zip(scaled.by_ref()) {
+            let encoded = (scaled * inverse).fast_round().as_int();
             update_bounds(&mut all, encoded);
             if T::decode_single(encoded, exponents).is_eq(value) {
                 update_bounds(&mut kept, encoded);
@@ -489,8 +524,8 @@ fn estimate_encoded_size_within<T: ALPFloat>(
         }
     }
 
-    for &value in remainder {
-        let encoded = T::encode_single_unchecked(value, exponents);
+    for (&value, scaled) in remainder.iter().zip(scaled) {
+        let encoded = (scaled * inverse).fast_round().as_int();
         update_bounds(&mut all, encoded);
         if T::decode_single(encoded, exponents).is_eq(value) {
             update_bounds(&mut kept, encoded);
