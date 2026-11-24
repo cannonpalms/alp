@@ -502,6 +502,52 @@ fn estimate_encoded_size_within<T: ALPFloat>(
     )
 }
 
+/// The running state of scoring one pair over the sample.
+struct Tally<T: ALPFloat> {
+    kept: Option<(T::ALPInt, T::ALPInt)>,
+    all: Option<(T::ALPInt, T::ALPInt)>,
+    patch_count: usize,
+}
+
+impl<T: ALPFloat> Tally<T> {
+    /// Scores `values` against the next values of `scaled`, returning `None` once the exceptions
+    /// alone cost more than `limit`.
+    #[inline(always)]
+    fn score(
+        &mut self,
+        values: &[T],
+        scaled: &mut impl Iterator<Item = T>,
+        exponents: Exponents,
+        limit: usize,
+    ) -> Option<()> {
+        let inverse = T::IF10[exponents.f as usize];
+        for (&value, scaled) in values.iter().zip(scaled) {
+            let encoded = (scaled * inverse).fast_round().as_int();
+            update_bounds(&mut self.all, encoded);
+            if T::decode_single(encoded, exponents).is_eq(value) {
+                update_bounds(&mut self.kept, encoded);
+            } else {
+                self.patch_count += 1;
+                if self.patch_count * patch_bytes::<T>() > limit {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// Whether the final size must exceed `limit`. Once any value round-trips, the final range
+    /// includes all kept values seen so far. Its bit width and the patch count can only grow.
+    /// Never rejects a possible tie.
+    #[inline(always)]
+    fn exceeds(&self, len: usize, limit: usize) -> bool {
+        limit != usize::MAX
+            && self.kept.is_some()
+            && encoded_bytes_for_range(len, self.kept) + self.patch_count * patch_bytes::<T>()
+                > limit
+    }
+}
+
 /// [`estimate_encoded_size_within`] with the values already multiplied by `10^e`, yielded by
 /// `scaled` in the order of `values`, so that the pairs sharing an `e` can reuse one scaling.
 ///
@@ -514,59 +560,31 @@ fn estimate_scaled<T: ALPFloat>(
     exponents: Exponents,
     limit: usize,
 ) -> Option<usize> {
-    let inverse = T::IF10[exponents.f as usize];
     // `encode` fills patched slots within the kept range, unless every value is patched.
-    let mut kept: Option<(T::ALPInt, T::ALPInt)> = None;
-    let mut all: Option<(T::ALPInt, T::ALPInt)> = None;
-    let mut patch_count = 0usize;
+    let mut tally = Tally::<T> {
+        kept: None,
+        all: None,
+        patch_count: 0,
+    };
 
     let (chunks, remainder) = values.as_chunks::<8>();
     for chunk in chunks {
-        for (&value, scaled) in chunk.iter().zip(scaled.by_ref()) {
-            let encoded = (scaled * inverse).fast_round().as_int();
-            update_bounds(&mut all, encoded);
-            if T::decode_single(encoded, exponents).is_eq(value) {
-                update_bounds(&mut kept, encoded);
-            } else {
-                patch_count += 1;
-                if patch_count * patch_bytes::<T>() > limit {
-                    return None;
-                }
-            }
-        }
-        // Once any value round-trips, the final range includes all kept values seen so far.
-        // Its bit width and the patch count can only grow. Check after each full chunk to
-        // avoid paying for range scoring at every sample, and never reject a possible tie.
-        if limit != usize::MAX
-            && kept.is_some()
-            && encoded_bytes_for_range(values.len(), kept) + patch_count * patch_bytes::<T>()
-                > limit
-        {
+        tally.score(chunk, &mut scaled, exponents, limit)?;
+        // Check after each full chunk to avoid paying for range scoring at every sample.
+        if tally.exceeds(values.len(), limit) {
             return None;
         }
     }
+    tally.score(remainder, &mut scaled, exponents, limit)?;
 
-    for (&value, scaled) in remainder.iter().zip(scaled) {
-        let encoded = (scaled * inverse).fast_round().as_int();
-        update_bounds(&mut all, encoded);
-        if T::decode_single(encoded, exponents).is_eq(value) {
-            update_bounds(&mut kept, encoded);
-        } else {
-            patch_count += 1;
-            if patch_count * patch_bytes::<T>() > limit {
-                return None;
-            }
-        }
-    }
-
-    let range = if patch_count == values.len() {
-        all
+    let range = if tally.patch_count == values.len() {
+        tally.all
     } else {
-        kept
+        tally.kept
     };
 
     let encoded_bytes = encoded_bytes_for_range(values.len(), range);
-    Some(encoded_bytes + patch_count * patch_bytes::<T>())
+    Some(encoded_bytes + tally.patch_count * patch_bytes::<T>())
 }
 
 /// Encodes one chunk into `encoded_output`, which covers the whole array: elements before
