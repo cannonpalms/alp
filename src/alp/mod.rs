@@ -507,7 +507,6 @@ fn estimate_encoded_size_within<T: ALPFloat>(
 /// The running state of scoring one pair over the sample.
 struct Tally<T: ALPFloat> {
     kept: Option<(T::ALPInt, T::ALPInt)>,
-    all: Option<(T::ALPInt, T::ALPInt)>,
     patch_count: usize,
 }
 
@@ -525,7 +524,6 @@ impl<T: ALPFloat> Tally<T> {
         let inverse = T::IF10[exponents.f as usize];
         for (&value, scaled) in values.iter().zip(scaled) {
             let encoded = (scaled * inverse).fast_round().as_int();
-            update_bounds(&mut self.all, encoded);
             if T::decode_single(encoded, exponents).is_eq(value) {
                 update_bounds(&mut self.kept, encoded);
             } else {
@@ -562,15 +560,14 @@ impl<T: ALPFloat> Tally<T> {
 #[inline]
 fn estimate_scaled<T: ALPFloat>(
     values: &[T],
-    mut scaled: impl Iterator<Item = T>,
+    mut scaled: impl Iterator<Item = T> + Clone,
     exponents: Exponents,
     limit: usize,
     tie_loses: bool,
 ) -> Option<usize> {
-    // `encode` fills patched slots within the kept range, unless every value is patched.
+    let second_pass = scaled.clone();
     let mut tally = Tally::<T> {
         kept: None,
-        all: None,
         patch_count: 0,
     };
 
@@ -595,8 +592,19 @@ fn estimate_scaled<T: ALPFloat>(
     }
     tally.score(remainder, &mut scaled, exponents, limit)?;
 
+    // `encode` fills patched slots within the kept range, unless every value is patched, which
+    // is rare enough to take the range in a second pass instead of tracking it for every value.
     let range = if tally.patch_count == values.len() {
-        tally.all
+        // The exceptions alone cost this much, whatever the range turns out to be.
+        if tie_loses && tally.patch_count * patch_bytes::<T>() == limit {
+            return None;
+        }
+        let inverse = T::IF10[exponents.f as usize];
+        let mut all = None;
+        for scaled in second_pass {
+            update_bounds(&mut all, (scaled * inverse).fast_round().as_int());
+        }
+        all
     } else {
         tally.kept
     };
