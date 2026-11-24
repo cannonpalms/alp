@@ -1,6 +1,11 @@
 #[cfg(target_arch = "x86_64")]
 mod avx2;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
+mod neon;
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_feature = "neon", not(miri))
+))]
 mod vector;
 
 use crate::sample::SamplePlan;
@@ -50,8 +55,9 @@ type PairScorer<T> = fn(&[T], &[T], Exponents, usize, bool) -> Option<usize>;
 ///
 /// On a short input the scalar path stops a pair after fewer values than a kernel that checks its
 /// bound once per chunk of eight, and the kernel's setup per pair is not paid back. At 24 values
-/// and above the kernel was not slower than the scalar path on x86-64 with AVX2, with or without
-/// a hint, for decimal and integer inputs.
+/// and above the AVX2 kernel was not slower than the scalar path on x86-64, with or without a
+/// hint, for decimal and integer inputs. The NEON kernel uses the same value; on Graviton3 it
+/// breaks even at about 12 values, so 24 is safe there too.
 const PAIR_SCORER_MIN_LEN: usize = 24;
 
 mod private {
@@ -74,13 +80,25 @@ mod private {
     impl Sealed for f64 {
         fn pair_scorer() -> Option<PairScorer<Self>> {
             #[cfg(target_arch = "x86_64")]
-            if std::arch::is_x86_feature_detected!("avx2") {
-                return Some(|values, scaled, exponents, limit, tie_loses| {
-                    // SAFETY: the CPU supports AVX2.
+            {
+                let score: PairScorer<f64> = |values, scaled, exponents, limit, tie_loses| {
+                    // SAFETY: the scorer is handed out only if the CPU supports AVX2.
                     unsafe { super::avx2::score_pair(values, scaled, exponents, limit, tie_loses) }
-                });
+                };
+                std::arch::is_x86_feature_detected!("avx2").then_some(score)
             }
-            None
+            // Miri does not support the saturating vector conversion the kernel uses.
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
+            {
+                Some(super::neon::score_pair)
+            }
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_feature = "neon", not(miri))
+            )))]
+            {
+                None
+            }
         }
     }
 }
@@ -1259,6 +1277,8 @@ mod tests {
         if std::arch::is_x86_feature_detected!("avx2") {
             assert!(scorer.is_some(), "AVX2 is available but there is no kernel");
         }
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(miri)))]
+        assert!(scorer.is_some(), "NEON is enabled but there is no kernel");
         scorer
     }
 
