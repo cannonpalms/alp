@@ -178,15 +178,12 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     #[inline]
     fn find_best_exponents(values: &[Self]) -> Exponents {
         let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
-        let mut sample = [Self::zero(); SAMPLE_SIZE];
-        for (slot, &value) in sample.iter_mut().zip(plan.iter(values)) {
-            *slot = value;
-        }
-        let sample = &sample[..plan.count()];
+        let (sample, len) = gather_interleaved(values, &plan);
+        let sample = &sample[..len];
         // `sample[i] * 10^e`, which every pair with the same `e` shares. `consider` is never
         // called with `e == 0`, so its first call fills this.
         let mut scaled = [Self::zero(); SAMPLE_SIZE];
-        let scaled = &mut scaled[..sample.len()];
+        let scaled = &mut scaled[..len];
         let mut scaled_e = 0;
 
         let mut best_exp = Exponents { e: 0, f: 0 };
@@ -461,6 +458,31 @@ fn encoded_bytes_for_range<I: PrimInt + ToPrimitive>(len: usize, bounds: Option<
         })
         .unwrap_or(size_of::<I>() * 8);
     (len * bits).div_ceil(8)
+}
+
+/// Copies the values `plan` selects into an array on the stack and returns it with the count.
+///
+/// For an input longer than [`SAMPLE_SIZE`] the plan has several equal runs. They are interleaved,
+/// so each chunk of eight scored by [`estimate_scaled`] holds one value from every run instead of
+/// one run's neighbours. Neighbouring values tend to encode close together, which would make the
+/// first range check see a narrow range and bound nothing. A shorter input is one run and keeps its
+/// order. The pair's size does not depend on the order.
+#[inline]
+fn gather_interleaved<T: ALPFloat>(values: &[T], plan: &SamplePlan) -> ([T; SAMPLE_SIZE], usize) {
+    let mut sample = [T::zero(); SAMPLE_SIZE];
+    let runs = plan.ranges().len();
+    debug_assert!(
+        plan.ranges()
+            .windows(2)
+            .all(|pair| pair[0].len() == pair[1].len()),
+        "slot `offset * runs + run` needs runs of equal length"
+    );
+    for (run, range) in plan.ranges().iter().enumerate() {
+        for (offset, &value) in values[range.clone()].iter().enumerate() {
+            sample[offset * runs + run] = value;
+        }
+    }
+    (sample, plan.count())
 }
 
 /// Returns the exact estimate, or `None` once a lower bound exceeds `limit`.
@@ -1084,6 +1106,31 @@ mod tests {
                     &vec![value as f32; len],
                     &format!("f32 {value} x {len}"),
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_sample_holds_the_planned_values() {
+        for len in [0, 1, 7, 63, 64, 65, 100, 1000, 4097] {
+            let values: Vec<f64> = (0..len).map(|i| i as f64).collect();
+            let plan = SamplePlan::subsample(len, SAMPLE_SIZE, SAMPLE_BLOCK);
+            let (sample, count) = gather_interleaved(&values, &plan);
+            let mut gathered = sample[..count].to_vec();
+            let mut planned: Vec<f64> = plan.iter(&values).copied().collect();
+            gathered.sort_by(f64::total_cmp);
+            planned.sort_by(f64::total_cmp);
+            assert_eq!(gathered, planned, "len {len}");
+            if len > SAMPLE_SIZE {
+                // Slot `offset * runs + run` holds offset `offset` of run `run`.
+                for (run, range) in plan.ranges().iter().enumerate() {
+                    for offset in 0..range.len() {
+                        assert_eq!(
+                            sample[offset * plan.ranges().len() + run],
+                            (range.start + offset) as f64
+                        );
+                    }
+                }
             }
         }
     }
