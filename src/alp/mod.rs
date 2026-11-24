@@ -798,6 +798,20 @@ mod tests {
             Self(0x517C_C1B7_2722_0A95)
         }
 
+        fn from_seed(seed: u64) -> Self {
+            let mut rng = Self(seed ^ 0x517C_C1B7_2722_0A95);
+            // Nearby seeds start with correlated states otherwise.
+            for _ in 0..4 {
+                rng.next_unit();
+            }
+            rng
+        }
+
+        /// A value in `0..n`.
+        fn next_below(&mut self, n: usize) -> usize {
+            (self.next_unit() * n as f64) as usize
+        }
+
         /// A value in `[0, 1)`.
         fn next_unit(&mut self) -> f64 {
             self.0 = self
@@ -851,6 +865,187 @@ mod tests {
             assert_eq!(find_best_exponents(sample), reference_search(sample));
             let f32s: Vec<f32> = sample.iter().map(|&v| v as f32).collect();
             assert_eq!(find_best_exponents(&f32s), reference_search(&f32s));
+        }
+    }
+
+    /// The size of a full encode, which shares no scoring or pruning code with the search.
+    fn encoded_size<T: ALPFloat>(sample: &[T], exponents: Exponents) -> usize {
+        let (_, encoded, _, patches, _) = T::encode(sample, Some(exponents));
+        T::estimate_encoded_size(&encoded, &patches)
+    }
+
+    /// The search as of 0.0.6: its candidate order and tie rule with no early exit, so every
+    /// pruning shortcut must land on the same pair.
+    fn frozen_search<T: ALPFloat>(values: &[T]) -> Exponents {
+        let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
+        let sample: Vec<T> = plan.iter(values).copied().collect();
+
+        let mut best_exp = Exponents { e: 0, f: 0 };
+        let mut best_nbytes = encoded_size(&sample, best_exp);
+        let mut consider = |exp: Exponents| {
+            let size = encoded_size(&sample, exp);
+            let digits = exp.e - exp.f;
+            let best_digits = best_exp.e - best_exp.f;
+            if size < best_nbytes
+                || (size == best_nbytes
+                    && (digits < best_digits
+                        || (digits == best_digits && best_exp.e != 0 && exp.e > best_exp.e)))
+            {
+                best_nbytes = size;
+                best_exp = exp;
+            }
+        };
+        for e in 1..T::MAX_EXPONENT {
+            consider(Exponents { e, f: 0 });
+        }
+        for e in (1..T::MAX_EXPONENT).rev() {
+            for f in 1..=e {
+                consider(Exponents { e, f });
+            }
+        }
+        best_exp
+    }
+
+    const SPECIALS: [f64; 18] = [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -0.0,
+        0.0,
+        f64::MAX,
+        f64::MIN,
+        f64::MIN_POSITIVE,
+        4.9e-324,
+        1e-40,
+        9.3e18,
+        -9.3e18,
+        3e9,
+        1e300,
+        9_223_372_036_854_775_808.0,
+        -9_223_372_036_854_775_808.0,
+        2_147_483_648.0,
+        -2_147_483_648.0,
+    ];
+
+    const KINDS: usize = 18;
+
+    fn decimal(rng: &mut Lcg) -> f64 {
+        let magnitude = 10f64.powi(rng.next_below(10) as i32 - 2);
+        let digits = rng.next_below(10) as i32;
+        rng.next_decimal(magnitude, digits)
+    }
+
+    /// Inputs shaped to reach every way a candidate can stop early or tie.
+    fn gen_values(rng: &mut Lcg, kind: usize, len: usize) -> Vec<f64> {
+        let magnitude = 10f64.powi(rng.next_below(14) as i32 - 3);
+        let digits = rng.next_below(10) as i32;
+        let signed = |rng: &mut Lcg, v: f64| if rng.next_below(2) == 0 { v } else { -v };
+        (0..len)
+            .map(|i| match kind {
+                0 => rng.next_decimal(magnitude, digits),
+                1 => (rng.next_unit() * magnitude).round(),
+                2 => rng.next_unit() * magnitude,
+                3 => match rng.next_below(4) {
+                    0 => decimal(rng),
+                    1 => (rng.next_unit() * 1e6).round(),
+                    2 => rng.next_unit() * 1e3,
+                    _ => SPECIALS[rng.next_below(SPECIALS.len())],
+                },
+                4 => SPECIALS[rng.next_below(SPECIALS.len())],
+                5 if rng.next_below(8) == 0 => SPECIALS[rng.next_below(SPECIALS.len())],
+                5 => rng.next_decimal(magnitude, digits),
+                // Every value is an exception under every pair.
+                6 => [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0][rng.next_below(4)],
+                7 => 1.0 / 3.0,
+                8 => [0.5, 2.5][rng.next_below(2)],
+                9 => (rng.next_below(4) as f64) / 10.0,
+                10 => {
+                    let v = rng.next_decimal(magnitude, digits);
+                    signed(rng, v)
+                }
+                // Sample runs of 8 differ from each other, and positions inside a run differ.
+                11 => rng.next_decimal(100.0, if (i / 8 + i) % 3 == 0 { 7 } else { 1 }),
+                12 => 1_700_000_000.0 + i as f64 * 0.001 * (1 + rng.next_below(2)) as f64,
+                13 => {
+                    if rng.next_below(40) == 0 {
+                        1e17 * rng.next_unit()
+                    } else {
+                        rng.next_decimal(10.0, 2)
+                    }
+                }
+                14 => rng.next_unit() * 1e-300,
+                // Repeating fractions never round-trip at a low exponent, so the pairs differ
+                // only in the range of values they encode.
+                15 => (1 + rng.next_below(20)) as f64 / [3.0, 7.0, 9.0, 11.0][digits as usize % 4],
+                16 => 1.0 / (3 + rng.next_below(3)) as f64 * magnitude,
+                // Mostly exceptions with a few clean values.
+                _ => {
+                    if rng.next_below(16) == 0 {
+                        rng.next_decimal(10.0, 1)
+                    } else {
+                        rng.next_unit() * 1e-3 + 1.0 / 3.0
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn check_search_matches_frozen<T: ALPFloat>(values: &[T], context: &str) {
+        let frozen = frozen_search(values);
+        assert_eq!(T::find_best_exponents(values), frozen, "{context}");
+    }
+
+    const SEARCH_LENGTHS: [usize; 18] = [
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 63, 64, 65, 129, 1000, 6000,
+    ];
+
+    #[test]
+    fn search_matches_frozen_search_on_random_inputs() {
+        for kind in 0..KINDS {
+            for len in SEARCH_LENGTHS {
+                for seed in 0..40u64 {
+                    let mut rng =
+                        Lcg::from_seed(((kind as u64) << 40) | ((len as u64) << 8) | seed);
+                    let values = gen_values(&mut rng, kind, len);
+                    let context = format!("kind {kind}, len {len}, seed {seed}");
+                    check_search_matches_frozen(&values, &format!("f64, {context}"));
+                    let f32s: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+                    check_search_matches_frozen(&f32s, &format!("f32, {context}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_finds_the_smallest_size_on_random_inputs() {
+        for kind in 0..KINDS {
+            for len in [1, 8, 33, 64] {
+                for seed in 0..40u64 {
+                    let mut rng =
+                        Lcg::from_seed(((kind as u64) << 40) | ((len as u64) << 8) | seed);
+                    let values = gen_values(&mut rng, kind, len);
+                    let found = f64::find_best_exponents(&values);
+                    let exhaustive = reference_search(&values);
+                    assert_eq!(
+                        f64::estimate_encoded_size_for_exponents(&values, found),
+                        f64::estimate_encoded_size_for_exponents(&values, exhaustive),
+                        "kind {kind}, len {len}, seed {seed}: {found} against {exhaustive}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_matches_frozen_search_on_exception_only_inputs() {
+        for len in [1, 7, 8, 9, 64, 65, 500] {
+            for value in [f64::NAN, f64::INFINITY, -0.0, 1e300, 1.0 / 3.0] {
+                check_search_matches_frozen(&vec![value; len], &format!("f64 {value} x {len}"));
+                check_search_matches_frozen(
+                    &vec![value as f32; len],
+                    &format!("f32 {value} x {len}"),
+                );
+            }
         }
     }
 
