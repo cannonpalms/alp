@@ -104,6 +104,15 @@ local. The module comment in `benches/alp_rd.rs` shows how to record the reason 
 For CPU kernels, keep the working set in the L2 cache of the runner unless memory bandwidth is the
 intended measurement.
 
+### Vary the input for code with data-dependent branches
+
+A benchmark that repeats one input lets the branch predictor learn every data-dependent branch in
+the code, so the case under-reports the cost for a caller that passes new data each time. For code
+like the exponent search, add cases that cycle through a pool of different inputs, and advance the
+pool index in the setup closure so that the choice is not measured. The `rotating_*` cases of
+`alp_exponent_search_*` in `benches/alp_encode.rs` do this, next to the fixed cases of the same
+group.
+
 ### Parameterize workloads
 
 Use a benchmark group with `bench_with_input` and `BenchmarkId` for different workloads. Keep the
@@ -143,7 +152,9 @@ from forks. The results are on [CodSpeed](https://app.codspeed.io/spiraldb/alp).
 
 The job uses the [CPU simulation](https://codspeed.io/docs/instruments/cpu) instrument. CodSpeed
 calls the closure five times as a warm-up, then estimates cycles from the instruction trace of one
-more call. The estimate includes cache and memory access costs. The Criterion settings
+more call. The estimate includes cache and memory access costs. The CodSpeed documentation does
+not say whether the estimate includes the cost of branch misprediction, so use a local
+`cargo bench` run to see that cost. The Criterion settings
 `sample_size`, `measurement_time`, and `warm_up_time` have no effect in CI.
 
 To do the same build locally, install `cargo-codspeed` and run:
