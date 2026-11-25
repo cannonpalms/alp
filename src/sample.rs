@@ -49,7 +49,6 @@ impl SamplePlan {
         Self { ranges, count }
     }
 
-    #[cfg(test)]
     pub(crate) fn ranges(&self) -> &[Range<usize>] {
         &self.ranges
     }
