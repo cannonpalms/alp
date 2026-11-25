@@ -87,6 +87,18 @@ pub fn find_best_exponents<F: ALPFloat>(values: &[F]) -> Exponents {
     F::find_best_exponents(values)
 }
 
+/// Finds the same exponent pair as [`find_best_exponents`], faster when `hint` is a good guess.
+///
+/// Callers that encode a column block by block can pass the exponents of the previous block. When
+/// the column's values keep the same number of decimals, those would usually be the best ones for
+/// the next block too. Scoring the hint first sets a tight bound early, so most other pairs stop
+/// after a few values. The result is the same with any hint,
+/// including a wrong or invalid one (`e` out of range, or `f` above `e`), which is ignored.
+#[inline]
+pub fn find_best_exponents_with_hint<F: ALPFloat>(values: &[F], hint: Exponents) -> Exponents {
+    F::find_best_exponents_with_hint(values, hint)
+}
+
 /// Encodes a single value, returning `None` if it does not round-trip under `exponents`.
 #[inline]
 pub fn encode_single<F: ALPFloat>(value: F, exponents: Exponents) -> Option<F::ALPInt> {
@@ -179,55 +191,13 @@ pub trait ALPFloat: private::Sealed + Float + Display + 'static {
     /// Large inputs are sampled in evenly spread contiguous runs to bound search cost.
     #[inline]
     fn find_best_exponents(values: &[Self]) -> Exponents {
-        let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
-        let (sample, len) = gather_interleaved(values, &plan);
-        let sample = &sample[..len];
-        // `sample[i] * 10^e`, which every pair with the same `e` shares. `consider` is never
-        // called with `e == 0`, so its first call fills this.
-        let mut scaled = [Self::zero(); SAMPLE_SIZE];
-        let scaled = &mut scaled[..len];
-        let mut scaled_e = 0;
+        search_exponents(values, None)
+    }
 
-        let mut best_exp = Exponents { e: 0, f: 0 };
-        let mut best_nbytes = Self::estimate_encoded_size_for_exponents(sample, best_exp);
-
-        let mut consider = |exp: Exponents| {
-            if scaled_e != exp.e {
-                let power = Self::F10[exp.e as usize];
-                for (scaled, &value) in scaled.iter_mut().zip(sample) {
-                    *scaled = value * power;
-                }
-                scaled_e = exp.e;
-            }
-            let digits = exp.e - exp.f;
-            let best_digits = best_exp.e - best_exp.f;
-            // Break size ties by fewer retained decimal digits, then the identity
-            // candidate (e=f=0), otherwise the largest exponent.
-            let wins_tie = digits < best_digits
-                || (digits == best_digits && best_exp.e != 0 && exp.e > best_exp.e);
-            let Some(size) =
-                estimate_scaled(sample, scaled.iter().copied(), exp, best_nbytes, !wins_tie)
-            else {
-                return;
-            };
-            if size < best_nbytes || (size == best_nbytes && wins_tie) {
-                best_nbytes = size;
-                best_exp = exp;
-            }
-        };
-
-        // Common decimal data often works with f=0 and a small exponent. Score these
-        // first to establish a useful bound before visiting the rest of the same space.
-        for e in 1..Self::MAX_EXPONENT {
-            consider(Exponents { e, f: 0 });
-        }
-        for e in (1..Self::MAX_EXPONENT).rev() {
-            for f in 1..=e {
-                consider(Exponents { e, f });
-            }
-        }
-
-        best_exp
+    /// Finds the same pair as [`Self::find_best_exponents`], scoring `hint` before the others.
+    #[inline]
+    fn find_best_exponents_with_hint(values: &[Self], hint: Exponents) -> Exponents {
+        search_exponents(values, Some(hint))
     }
 
     /// Estimates the encoded size of `values` under `exponents`, matching a full
@@ -484,6 +454,80 @@ fn gather_interleaved<T: ALPFloat>(values: &[T], plan: &SamplePlan) -> ([T; SAMP
         }
     }
     (sample, plan.count())
+}
+
+/// The search behind [`ALPFloat::find_best_exponents`] and
+/// [`ALPFloat::find_best_exponents_with_hint`].
+///
+/// A `hint` that is the identity pair or out of range is ignored. The identity pair is always
+/// scored first, and any other pair outside the candidate set, `e` below [`ALPFloat::MAX_EXPONENT`]
+/// and `f` at most `e`, could win although the search never returns it.
+fn search_exponents<T: ALPFloat>(values: &[T], hint: Option<Exponents>) -> Exponents {
+    let hint = hint.filter(|h| h.e < T::MAX_EXPONENT && h.f <= h.e && h.e != 0);
+    let plan = SamplePlan::subsample(values.len(), SAMPLE_SIZE, SAMPLE_BLOCK);
+    let (sample, len) = gather_interleaved(values, &plan);
+    let sample = &sample[..len];
+    // `sample[i] * 10^e`, which every pair with the same `e` shares. `consider` is never called
+    // with `e == 0`, so its first call fills this.
+    let mut scaled = [T::zero(); SAMPLE_SIZE];
+    let scaled = &mut scaled[..len];
+    let mut scaled_e = 0;
+
+    let mut best_exp = Exponents { e: 0, f: 0 };
+    let mut best_nbytes = T::estimate_encoded_size_for_exponents(sample, best_exp);
+
+    let mut consider = |exp: Exponents| {
+        if scaled_e != exp.e {
+            let power = T::F10[exp.e as usize];
+            for (scaled, &value) in scaled.iter_mut().zip(sample) {
+                *scaled = value * power;
+            }
+            scaled_e = exp.e;
+        }
+        let digits = exp.e - exp.f;
+        let best_digits = best_exp.e - best_exp.f;
+        // Break size ties by fewer retained decimal digits, then the identity
+        // candidate (e=f=0), otherwise the largest exponent.
+        let wins_tie = digits < best_digits
+            || (digits == best_digits && best_exp.e != 0 && exp.e > best_exp.e);
+        let Some(size) =
+            estimate_scaled(sample, scaled.iter().copied(), exp, best_nbytes, !wins_tie)
+        else {
+            return;
+        };
+        if size < best_nbytes || (size == best_nbytes && wins_tie) {
+            best_nbytes = size;
+            best_exp = exp;
+        }
+    };
+
+    // The pair that wins is the minimum of a strict total order over pairs: size, then fewer
+    // digits, then the identity pair, then the larger `e`. Two distinct pairs never compare
+    // equal, because the same digits and `e` mean the same `f`. A pair is skipped only when it
+    // cannot beat the best pair seen so far, so the minimum does not depend on the visiting order
+    // and the hint only changes how soon the bound is tight.
+    if let Some(hint) = hint {
+        consider(hint);
+    }
+
+    // Common decimal data often works with f=0 and a small exponent. Score these
+    // first to establish a useful bound before visiting the rest of the same space.
+    for e in 1..T::MAX_EXPONENT {
+        let exp = Exponents { e, f: 0 };
+        if hint != Some(exp) {
+            consider(exp);
+        }
+    }
+    for e in (1..T::MAX_EXPONENT).rev() {
+        for f in 1..=e {
+            let exp = Exponents { e, f };
+            if hint != Some(exp) {
+                consider(exp);
+            }
+        }
+    }
+
+    best_exp
 }
 
 /// Returns the exact estimate, or `None` once a lower bound exceeds `limit`.
@@ -1117,6 +1161,73 @@ mod tests {
                     let f32s: Vec<f32> = values.iter().map(|&v| v as f32).collect();
                     check_search_matches_frozen(&f32s, &format!("f32, {context}"));
                 }
+            }
+        }
+    }
+
+    fn check_hints_do_not_change_the_search<T: ALPFloat>(values: &[T], context: &str) {
+        let expected = T::find_best_exponents(values);
+        let mut hints = vec![
+            expected,
+            Exponents { e: 0, f: 0 },
+            Exponents { e: 1, f: 0 },
+            Exponents { e: 1, f: 1 },
+            Exponents { e: 3, f: 1 },
+            Exponents {
+                e: T::MAX_EXPONENT - 1,
+                f: 0,
+            },
+            Exponents {
+                e: T::MAX_EXPONENT - 1,
+                f: T::MAX_EXPONENT - 1,
+            },
+            // Invalid: `e` out of range, or `f` above `e`.
+            Exponents {
+                e: T::MAX_EXPONENT,
+                f: 0,
+            },
+            Exponents { e: u8::MAX, f: 0 },
+            Exponents { e: 0, f: 1 },
+            Exponents { e: 2, f: 3 },
+            Exponents {
+                e: T::MAX_EXPONENT,
+                f: T::MAX_EXPONENT,
+            },
+        ];
+        hints.push(frozen_search(&values[..values.len() / 2]));
+        for hint in hints {
+            assert_eq!(
+                T::find_best_exponents_with_hint(values, hint),
+                expected,
+                "{context}, hint {hint}"
+            );
+            assert_eq!(find_best_exponents_with_hint(values, hint), expected);
+        }
+    }
+
+    #[test]
+    fn hint_does_not_change_the_result_on_random_inputs() {
+        for kind in 0..KINDS {
+            for len in SEARCH_LENGTHS {
+                for seed in 0..8u64 {
+                    let mut rng =
+                        Lcg::from_seed(((kind as u64) << 40) | ((len as u64) << 8) | seed);
+                    let values = gen_values(&mut rng, kind, len);
+                    let context = format!("kind {kind}, len {len}, seed {seed}");
+                    check_hints_do_not_change_the_search(&values, &format!("f64, {context}"));
+                    let f32s: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+                    check_hints_do_not_change_the_search(&f32s, &format!("f32, {context}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hint_does_not_change_the_result_on_exception_only_inputs() {
+        for len in [1, 7, 8, 9, 64, 65, 500] {
+            for value in [f64::NAN, f64::INFINITY, -0.0, 1e300, 1.0 / 3.0] {
+                check_hints_do_not_change_the_search(&vec![value; len], "f64");
+                check_hints_do_not_change_the_search(&vec![value as f32; len], "f32");
             }
         }
     }
